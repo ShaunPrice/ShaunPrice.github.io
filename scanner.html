@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="theme-color" content="#0e1422">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="icon" href="data:,">
 <title>PocketScan 3D — Browser 3D Scanner</title>
 <style>
   :root{
@@ -147,7 +148,14 @@
       </select>
     </div>
     <div class="row">
-      <label>Silhouette threshold<span class="hint">Teal overlay should cover the object only.</span></label>
+      <label>Segmentation<span class="hint" id="aiStatus">Loading AI model…</span></label>
+      <select id="segSel">
+        <option value="ai" selected>AI (U²-Net)</option>
+        <option value="color">Colour threshold</option>
+      </select>
+    </div>
+    <div class="row">
+      <label><span id="thrLabelText">AI mask cutoff</span><span class="hint" id="thrHint">Higher = tighter mask. Live overlay is approximate; the AI refines it on capture.</span></label>
       <input type="range" id="thrRange" min="8" max="110" value="46">
     </div>
     <div class="row">
@@ -173,6 +181,9 @@
     3. Hold the phone upright (portrait) and level with the object's middle.<br>
     4. Take 12–24 shots evenly spaced through a full circle.<br>
     5. In <b>Rotate object</b> mode, keep the phone still and turn the object one step per shot.</p>
+    <p><b>AI segmentation</b> (default) isolates the object automatically; a plain background
+    still improves edge quality. If the AI mask misbehaves on an unusual object, switch to
+    Colour threshold mode and tap the background to sample it.</p>
     <p>This scanner reconstructs the object's <i>visual hull</i> from its outlines — bowls and deep
     hollows facing the camera cannot be captured, and fine detail is approximate. It is best suited
     to compact, convex-ish objects.</p>
@@ -191,6 +202,10 @@
         <option value="128">High · 128³</option>
         <option value="160">Max · 160³</option>
       </select>
+    </div>
+    <div class="row">
+      <label>Auto-align shots<span class="hint">Re-centres and re-scales each silhouette to correct framing drift between shots.</span></label>
+      <span class="chip on" id="alignBtn">On</span>
     </div>
     <div class="row"><button class="btn" id="buildBtn">Build 3D model</button></div>
     <progress id="buildProg" max="100" value="0" style="display:none"></progress>
@@ -273,8 +288,8 @@
 </section>
 
 <footer>
-  PocketScan 3D · runs entirely in your browser · photos never leave the phone<br>
-  <span id="verLine">v1.0</span>
+  PocketScan 3D · runs entirely in your browser · photos never leave the phone · AI segmentation: U²-Net (Apache-2.0)<br>
+  <span id="verLine">v1.1</span>
 </footer>
 <div id="toast"></div>
 
@@ -292,7 +307,7 @@ const CAPTURE_S=352, PREVIEW_S=224;
 
 const state={
   tab:'capture', camOn:false, mode:'walk', planned:12, dirSign:-1,
-  threshold:46, bgAuto:true, bgColor:[240,240,240],
+  threshold:46, bgAuto:true, bgColor:[240,240,240], segMode:'ai', align:true,
   shots:[],            // {mask:Uint8Array, S, angle, basis:[rx,ry,rz,ux,uy,uz], thumb}
   gridN:96, origGrid:null, needRebuild:false,
   mesh:null,           // {positions, indices, partsBefore, partsKept, voxels}
@@ -442,6 +457,118 @@ function computeMask(data,S,bg,thr){
 }
 function maskFill(m){ let c=0; for(let i=0;i<m.length;i++) c+=m[i]; return c/m.length; }
 
+/* ============================== AI segmentation (U²-Net via onnxruntime-web) ============================== */
+const AI={
+  session:null, status:'loading', IS:320, can:null, ctx:null,
+  urls:(function(){
+    if(new URLSearchParams(location.search).has('aidev'))
+      return {ort:['./node_modules/onnxruntime-web/dist/ort.min.js'],
+              wasm:['./node_modules/onnxruntime-web/dist/'],
+              model:['./test_assets/standin.onnx']};
+    return {
+      ort:['https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/ort.min.js',
+           'https://unpkg.com/onnxruntime-web@1.16.3/dist/ort.min.js'],
+      wasm:['https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/',
+            'https://unpkg.com/onnxruntime-web@1.16.3/dist/'],
+      model:['https://huggingface.co/BritishWerewolf/U-2-Netp/resolve/main/onnx/model.onnx',
+             'https://huggingface.co/Meloss19/u2netp-web/resolve/main/u2netp.onnx']};
+  })(),
+  setStatus(st,msg){
+    this.status=st; const el=$('aiStatus'); if(el) el.textContent=msg;
+    if(st==='failed'&&state.segMode==='ai'){
+      state.segMode='color'; const sel=$('segSel'); if(sel) sel.value='color';
+      syncSegUI(); toast('AI model unavailable — using colour threshold');
+    }
+  },
+  loadScript(i){
+    return new Promise((res,rej)=>{
+      if(i>=this.urls.ort.length) return rej(new Error('runtime unreachable'));
+      const sc=document.createElement('script'); sc.src=this.urls.ort[i];
+      sc.onload=()=>res(i);
+      sc.onerror=()=>{ sc.remove(); this.loadScript(i+1).then(res,rej); };
+      document.head.appendChild(sc);
+    });
+  },
+  async fetchModel(){
+    let last=null;
+    for(const u of this.urls.model){
+      try{ const r=await fetch(u); if(!r.ok) throw new Error('HTTP '+r.status);
+        return await r.arrayBuffer(); }catch(e){ last=e; }
+    }
+    throw last||new Error('model unreachable');
+  },
+  async init(){
+    try{
+      this.setStatus('loading','Loading AI model (≈5 MB, first visit only)…');
+      const ci=await this.loadScript(0);
+      ort.env.wasm.numThreads=1;
+      ort.env.wasm.wasmPaths=this.urls.wasm[Math.min(ci,this.urls.wasm.length-1)];
+      const buf=await this.fetchModel();
+      this.session=await ort.InferenceSession.create(buf,{executionProviders:['wasm']});
+      this.can=document.createElement('canvas'); this.can.width=this.can.height=this.IS;
+      this.ctx=this.can.getContext('2d',{willReadFrequently:true});
+      this.setStatus('ready','AI model ready — the mask is computed on each capture.');
+    }catch(err){
+      this.setStatus('failed','AI unavailable here ('+String(err&&err.message||err)+') — colour threshold in use.');
+    }
+  },
+  cutoff(){ return 0.2+(state.threshold-8)/(110-8)*0.6; },
+  async maskFrom(drawFn){
+    const IS=this.IS;
+    this.ctx.clearRect(0,0,IS,IS); drawFn(this.ctx,IS);
+    const d=this.ctx.getImageData(0,0,IS,IS).data;
+    const A=IS*IS, input=new Float32Array(3*A);
+    for(let i=0,p=0;i<A;i++,p+=4){
+      input[i]    =(d[p]  /255-0.485)/0.229;
+      input[A+i]  =(d[p+1]/255-0.456)/0.224;
+      input[2*A+i]=(d[p+2]/255-0.406)/0.225;
+    }
+    const feeds={};
+    feeds[this.session.inputNames[0]]=new ort.Tensor('float32',input,[1,3,IS,IS]);
+    const out=await this.session.run(feeds);
+    const t=out[this.session.outputNames[0]].data;
+    let mn=Infinity,mx=-Infinity;
+    for(let i=0;i<A;i++){ const v=t[i]; if(v<mn)mn=v; if(v>mx)mx=v; }
+    const rng=(mx-mn)||1, cut=this.cutoff();
+    const S=CAPTURE_S, m=new Uint8Array(S*S), sc=IS/S;
+    for(let y=0;y<S;y++){ const sy=(y*sc)|0;
+      for(let x=0;x<S;x++){ const sx=(x*sc)|0;
+        m[y*S+x]=((t[sy*IS+sx]-mn)/rng)>cut?1:0; } }
+    const scb=_scratch(S);
+    _erode(m,scb.a,S); _dilate(scb.a,m,S);
+    _dilate(m,scb.a,S); _erode(scb.a,scb.b,S);
+    m.set(scb.b); keepLargest2D(m,S); fillHoles2D(m,S);
+    return m;
+  }
+};
+window.AI=AI;
+function syncSegUI(){
+  const ai=state.segMode==='ai';
+  const l=$('thrLabelText'), h=$('thrHint');
+  if(l) l.textContent=ai?'AI mask cutoff':'Silhouette threshold';
+  if(h) h.textContent=ai?'Higher = tighter mask. Live overlay is approximate; the AI refines it on capture.'
+                        :'Highlight overlay should cover the object only.';
+}
+function alignMask(mask,S){
+  const cp=mask.slice(); keepLargest2D(cp,S);
+  let x0=S,x1=-1,y0=S,y1=-1;
+  for(let y=0;y<S;y++)for(let x=0;x<S;x++)
+    if(cp[y*S+x]){ if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; }
+  if(x1<0) return mask.slice();
+  const w=x1-x0+1, h=y1-y0+1, cx=(x0+x1)/2, cy=(y0+y1)/2;
+  const sf=clamp(0.62*S/Math.max(w,h),0.5,2.5);
+  const out=new Uint8Array(S*S);
+  for(let y=0;y<S;y++){
+    const sy=Math.round(cy+(y-S/2)/sf); if(sy<0||sy>=S) continue;
+    for(let x=0;x<S;x++){
+      const sx=Math.round(cx+(x-S/2)/sf);
+      if(sx>=0&&sx<S&&mask[sy*S+sx]) out[y*S+x]=1;
+    }
+  }
+  return out;
+}
+window.alignMask=alignMask;
+
 /* ============================== live preview ============================== */
 const overlay=$('overlay'); const octx=overlay.getContext('2d');
 const prevCan=document.createElement('canvas'); prevCan.width=prevCan.height=PREVIEW_S;
@@ -528,9 +655,20 @@ async function captureShot(){
     await enableMotion(true);                       // capture tap doubles as the iOS permission gesture
     toast('Motion sensors enabled — capture again'); return;
   }
-  const img=capCtx.getImageData(0,0,CAPTURE_S,CAPTURE_S);
-  const bg=state.bgAuto?estimateBG(img.data,CAPTURE_S):state.bgColor;
-  const mask=computeMask(img.data,CAPTURE_S,bg,state.threshold);
+  let mask=null;
+  if(state.segMode==='ai'&&AI.status==='ready'){
+    $('shotBtn').disabled=true;
+    try{
+      mask=await AI.maskFrom(c=>{ const vw=cam.videoWidth,vh=cam.videoHeight,mm=Math.min(vw,vh);
+        c.drawImage(cam,(vw-mm)/2,(vh-mm)/2,mm,mm,0,0,AI.IS,AI.IS); });
+    }catch(err){ toast('AI segmentation failed on this shot — colour threshold used'); mask=null; }
+    finally{ $('shotBtn').disabled=false; }
+  }
+  if(!mask){
+    const img=capCtx.getImageData(0,0,CAPTURE_S,CAPTURE_S);
+    const bg=state.bgAuto?estimateBG(img.data,CAPTURE_S):state.bgColor;
+    mask=computeMask(img.data,CAPTURE_S,bg,state.threshold);
+  }
   const fill=maskFill(mask);
   if(fill<0.02){ toast('No object detected — adjust threshold or background'); return; }
   if(fill>0.85){ toast('Silhouette fills the frame — move back or raise threshold'); return; }
@@ -812,7 +950,7 @@ const Engine=(()=>{
       const shots=state.shots, S=shots[0].S, count=shots.length, N=state.gridN;
       const masks=new Uint8Array(count*S*S);
       const bases=new Float32Array(count*6);
-      shots.forEach((s,i)=>{ masks.set(s.mask,i*S*S); bases.set(s.basis,i*6); });
+      shots.forEach((s,i)=>{ masks.set(state.align?alignMask(s.mask,S):s.mask,i*S*S); bases.set(s.basis,i*6); });
       return call('carve',{masks,bases,S,N,count},[masks.buffer,bases.buffer],onprog);
     },
     refine(onprog){
@@ -961,7 +1099,7 @@ async function buildModel(){
     const res=await Engine.carve(p=>{ $('buildProg').value=p.step/p.total*100; });
     if(res.voxels===0){
       $('buildMsg').textContent='Nothing remained after carving — check silhouettes and angles.';
-      toast('Empty result — verify the teal overlay covered the object in every shot');
+      toast('Empty result — verify the mask overlay covered the object in every shot');
       return;
     }
     state.origGrid=res.grid; state.needRebuild=false; $('rebuildPill').classList.remove('show');
@@ -1194,6 +1332,18 @@ $('modeSel').addEventListener('change',e=>{
 $('plannedSel').addEventListener('change',e=>{ state.planned=parseInt(e.target.value,10); renderGallery(); });
 $('dirSel').addEventListener('change',e=>{ state.dirSign=e.target.value==='ccw'?-1:1; renderGallery(); });
 $('thrRange').addEventListener('input',e=>{ state.threshold=parseInt(e.target.value,10); });
+$('segSel').addEventListener('change',e=>{
+  if(e.target.value==='ai'&&AI.status==='failed'){
+    e.target.value='color'; toast('AI model unavailable on this device'); }
+  state.segMode=e.target.value; syncSegUI();
+});
+$('alignBtn').addEventListener('click',()=>{
+  state.align=!state.align;
+  $('alignBtn').classList.toggle('on',state.align);
+  $('alignBtn').textContent=state.align?'On':'Off';
+  if(state.origGrid){ state.needRebuild=true; $('rebuildPill').classList.add('show');
+    toast('Alignment changed — rebuild in Step 2'); }
+});
 
 let resetArm=0;
 $('resetBtn').addEventListener('click',()=>{
@@ -1230,9 +1380,10 @@ $('resetPostBtn').addEventListener('click',()=>resetPost(true));
   if(!window.isSecureContext||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)
     $('secureWarn').style.display='block';
   enableMotion(false);
+  AI.init(); syncSegUI();
   renderGallery(); drawDial();
   requestAnimationFrame(tick);
-  $('verLine').textContent='v1.0 · visual-hull engine · '+
+  $('verLine').textContent='v1.1 · visual-hull + U²-Net segmentation · '+
     (window.isSecureContext?'secure context':'non-secure context (camera disabled)');
 })();
 </script>
