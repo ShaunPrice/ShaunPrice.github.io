@@ -88,6 +88,19 @@
   .pill{display:none; background:#41321c; color:var(--warn); border:1px solid #6b5626; font-size:12px;
     border-radius:10px; padding:7px 10px; margin-bottom:10px;}
   .pill.show{display:block;}
+  .thumb .edit{position:absolute; right:4px; bottom:4px; background:rgba(0,0,0,.62); color:#9fd6ea;
+    font-size:11px; padding:1px 5px; border-radius:6px; pointer-events:none;}
+  #maskEd{position:fixed; inset:0; background:var(--bg); z-index:100; display:none; flex-direction:column;}
+  #maskEd.open{display:flex;}
+  .med-head{display:flex; align-items:center; gap:10px; padding:12px 14px;}
+  .med-head b{flex:1; font-size:14px; font-weight:600;}
+  #medCanvas{width:100%; aspect-ratio:1/1; background:#000; touch-action:none; flex:none; display:block;}
+  .med-tools{padding:12px 14px; display:flex; flex-direction:column; gap:12px;}
+  .med-row{display:flex; gap:8px; align-items:center;}
+  .med-row .chip{padding:9px 18px; font-size:13.5px;}
+  .brushprev{width:46px; height:46px; flex:none; border:1px solid var(--line); border-radius:10px;
+    display:flex; align-items:center; justify-content:center;}
+  .brushdot{background:var(--acc); border-radius:50%; width:16px; height:16px;}
 </style>
 </head>
 <body>
@@ -151,6 +164,7 @@
       <label>Segmentation<span class="hint" id="aiStatus">Loading AI model…</span></label>
       <select id="segSel">
         <option value="ai" selected>AI (U²-Net)</option>
+        <option value="bgdiff">Background photo</option>
         <option value="color">Colour threshold</option>
       </select>
     </div>
@@ -158,7 +172,11 @@
       <label><span id="thrLabelText">AI mask cutoff</span><span class="hint" id="thrHint">Higher = tighter mask. Live overlay is approximate; the AI refines it on capture.</span></label>
       <input type="range" id="thrRange" min="8" max="110" value="46">
     </div>
-    <div class="row">
+    <div class="row" id="bgRefRow" style="display:none">
+      <label>Background reference<span class="hint" id="bgRefStatus">No background captured yet — remove the object, keep the phone still, then capture it.</span></label>
+      <span class="chip" id="bgRefBtn">Capture background</span>
+    </div>
+    <div class="row" id="bgColorRow">
       <label>Background colour<span class="hint">Tap the background in the viewfinder to sample it.</span></label>
       <span class="chip on" id="bgAutoBtn">Auto</span>
     </div>
@@ -172,6 +190,7 @@
   <div class="card">
     <h2>Shots <span id="shotCount" style="color:var(--acc)">0</span></h2>
     <div id="gallery"></div>
+    <div style="font-size:11px;color:var(--dim);margin-top:4px">Tap a shot to paint its mask in or out; ✕ deletes it.</div>
   </div>
 
   <details>
@@ -184,6 +203,9 @@
     <p><b>AI segmentation</b> (default) isolates the object automatically; a plain background
     still improves edge quality. If the AI mask misbehaves on an unusual object, switch to
     Colour threshold mode and tap the background to sample it.</p>
+    <p><b>Background photo</b> mode suits busy scenes: prop the phone still (Rotate-object mode),
+    capture the empty scene once, then place the object back — whatever changed becomes the model.
+    See-through gaps such as a handle loop subtract naturally.</p>
     <p>This scanner reconstructs the object's <i>visual hull</i> from its outlines — bowls and deep
     hollows facing the camera cannot be captured, and fine detail is approximate. It is best suited
     to compact, convex-ish objects.</p>
@@ -289,8 +311,30 @@
 
 <footer>
   PocketScan 3D · runs entirely in your browser · photos never leave the phone · AI segmentation: U²-Net (Apache-2.0)<br>
-  <span id="verLine">v1.1</span>
+  <span id="verLine">v1.3</span>
 </footer>
+<div id="maskEd">
+  <div class="med-head"><b id="medTitle">Refine mask</b>
+    <button class="btn ghost small" id="medCancel">Cancel</button>
+    <button class="btn small" id="medDone" style="width:auto">Done</button></div>
+  <canvas id="medCanvas"></canvas>
+  <div class="med-tools">
+    <div class="med-row">
+      <span class="chip on" id="medIn">Paint in</span>
+      <span class="chip" id="medOut">Erase</span>
+      <span style="flex:1"></span>
+      <button class="btn ghost small" id="medUndo">Undo</button>
+      <button class="btn ghost small" id="medReset">Reset</button>
+    </div>
+    <div class="med-row">
+      <span style="color:var(--dim);font-size:12.5px">Brush</span>
+      <input type="range" id="medBrush" min="4" max="44" value="16">
+      <span class="brushprev"><span class="brushdot" id="medBrushDot"></span></span>
+    </div>
+    <div style="color:var(--dim);font-size:11.5px;line-height:1.5">Blue = kept in the model.
+      One finger paints · two fingers pinch to zoom · Reset returns to the automatic mask.</div>
+  </div>
+</div>
 <div id="toast"></div>
 
 <script>
@@ -307,7 +351,7 @@ const CAPTURE_S=352, PREVIEW_S=224;
 
 const state={
   tab:'capture', camOn:false, mode:'walk', planned:12, dirSign:-1,
-  threshold:46, bgAuto:true, bgColor:[240,240,240], segMode:'ai', align:true,
+  threshold:46, bgAuto:true, bgColor:[240,240,240], segMode:'ai', align:true, bgRef:null,
   shots:[],            // {mask:Uint8Array, S, angle, basis:[rx,ry,rz,ux,uy,uz], thumb}
   gridN:96, origGrid:null, needRebuild:false,
   mesh:null,           // {positions, indices, partsBefore, partsKept, voxels}
@@ -442,6 +486,51 @@ function fillHoles2D(m,S){
   }
   for(let i=0;i<n;i++) if(!m[i]&&!vis[i]) m[i]=1;
 }
+function fillHolesLimited(m,S,maxFrac){
+  const n=S*S, lab=new Int32Array(n), queue=new Int32Array(n);
+  let h=0,t=0;
+  const push=i=>{ if(!lab[i]&&!m[i]){ lab[i]=1; queue[t++]=i; } };
+  for(let x=0;x<S;x++){ push(x); push(n-S+x); }
+  for(let y=0;y<S;y++){ push(y*S); push(y*S+S-1); }
+  while(h<t){ const c=queue[h++], x=c%S, y=(c/S)|0;
+    if(x>0)push(c-1); if(x<S-1)push(c+1); if(y>0)push(c-S); if(y<S-1)push(c+S); }
+  const maxA=maxFrac*n;
+  for(let st=0;st<n;st++){
+    if(m[st]||lab[st]) continue;
+    let hh=0,tt=0; const comp=[]; lab[st]=2; queue[tt++]=st;
+    while(hh<tt){ const c=queue[hh++]; comp.push(c);
+      const x=c%S, y=(c/S)|0;
+      if(x>0&&!m[c-1]&&!lab[c-1]){lab[c-1]=2;queue[tt++]=c-1;}
+      if(x<S-1&&!m[c+1]&&!lab[c+1]){lab[c+1]=2;queue[tt++]=c+1;}
+      if(y>0&&!m[c-S]&&!lab[c-S]){lab[c-S]=2;queue[tt++]=c-S;}
+      if(y<S-1&&!m[c+S]&&!lab[c+S]){lab[c+S]=2;queue[tt++]=c+S;}
+    }
+    if(comp.length<=maxA) for(const c of comp) m[c]=1;
+  }
+}
+window.fillHolesLimited=fillHolesLimited;
+function diffMask(data,ref,S,thr){
+  const band=Math.max(3,(S/32)|0);
+  let cr=0,cg=0,cb=0,rr=0,rg=0,rb=0;
+  const acc=(x,y)=>{ const p=(y*S+x)*4;
+    cr+=data[p]; cg+=data[p+1]; cb+=data[p+2];
+    rr+=ref[p];  rg+=ref[p+1];  rb+=ref[p+2]; };
+  for(let y=0;y<band;y++) for(let x=0;x<S;x+=3){ acc(x,y); acc(x,S-1-y); }
+  for(let x=0;x<band;x++) for(let y=0;y<S;y+=3){ acc(x,y); acc(S-1-x,y); }
+  const gR=clamp(cr/(rr||1),0.6,1.6), gG=clamp(cg/(rg||1),0.6,1.6), gB=clamp(cb/(rb||1),0.6,1.6);
+  const t2=thr*thr*3, n=S*S, sc=_scratch(S), m=new Uint8Array(n);
+  for(let i=0,p=0;i<n;i++,p+=4){
+    const dr=data[p]-ref[p]*gR, dg=data[p+1]-ref[p+1]*gG, db=data[p+2]-ref[p+2]*gB;
+    m[i]=(dr*dr+dg*dg+db*db)>t2?1:0;
+  }
+  _erode(m,sc.a,S); _dilate(sc.a,m,S);
+  _dilate(m,sc.a,S); _erode(sc.a,sc.b,S);
+  m.set(sc.b);
+  keepLargest2D(m,S);
+  fillHolesLimited(m,S,0.015);
+  return m;
+}
+window.diffMask=diffMask;
 function computeMask(data,S,bg,thr){
   const t2=thr*thr*3, n=S*S, sc=_scratch(S), m=new Uint8Array(n);
   for(let i=0,p=0;i<n;i++,p+=4){
@@ -537,17 +626,23 @@ const AI={
     const scb=_scratch(S);
     _erode(m,scb.a,S); _dilate(scb.a,m,S);
     _dilate(m,scb.a,S); _erode(scb.a,scb.b,S);
-    m.set(scb.b); keepLargest2D(m,S); fillHoles2D(m,S);
+    m.set(scb.b); keepLargest2D(m,S); fillHolesLimited(m,S,0.015);
     return m;
   }
 };
 window.AI=AI;
 function syncSegUI(){
-  const ai=state.segMode==='ai';
+  const mode=state.segMode;
   const l=$('thrLabelText'), h=$('thrHint');
-  if(l) l.textContent=ai?'AI mask cutoff':'Silhouette threshold';
-  if(h) h.textContent=ai?'Higher = tighter mask. Live overlay is approximate; the AI refines it on capture.'
-                        :'Highlight overlay should cover the object only.';
+  if(l) l.textContent= mode==='ai'?'AI mask cutoff'
+      : mode==='bgdiff'?'Difference threshold':'Silhouette threshold';
+  if(h) h.textContent= mode==='ai'
+      ? 'Higher = tighter mask. Live overlay is approximate; the AI refines it on capture.'
+      : mode==='bgdiff'
+      ? 'Anything differing from the background photo becomes the object. Raise this if noise appears.'
+      : 'Highlight overlay should cover the object only.';
+  const br=$('bgRefRow'); if(br) br.style.display= mode==='bgdiff'?'flex':'none';
+  const bc=$('bgColorRow'); if(bc) bc.style.display= mode==='color'?'flex':'none';
 }
 function alignMask(mask,S){
   const cp=mask.slice(); keepLargest2D(cp,S);
@@ -569,6 +664,163 @@ function alignMask(mask,S){
 }
 window.alignMask=alignMask;
 
+/* ============================== per-shot mask paint editor ============================== */
+const MaskEd={
+  idx:-1, S:0, mask:null, undoStack:[], mode:'in', brush:16,
+  view:{s:1,tx:0,ty:0}, ptrs:new Map(), stroke:false, lastPt:null, pinch:null,
+  tintCan:null, tintCtx:null, imgCan:null, dirtyTint:true,
+  open(i){
+    const shot=state.shots[i]; if(!shot) return;
+    this.idx=i; this.S=shot.S; this.mask=shot.mask.slice(); this.undoStack=[];
+    this.view={s:1,tx:0,ty:0}; this.dirtyTint=true;
+    if(!this.tintCan){
+      this.tintCan=document.createElement('canvas');
+      this.tintCtx=this.tintCan.getContext('2d');
+      this.imgCan=document.createElement('canvas');
+    }
+    this.tintCan.width=this.tintCan.height=this.S;
+    this.imgCan.width=this.imgCan.height=this.S;
+    const ic=this.imgCan.getContext('2d');
+    ic.fillStyle='#1a222e'; ic.fillRect(0,0,this.S,this.S);
+    if(shot.photo){
+      const im=new Image();
+      im.onload=()=>{ ic.drawImage(im,0,0,this.S,this.S); this.render(); };
+      im.src=shot.photo;
+    }
+    $('medTitle').textContent='Refine mask — shot '+(i+1)+' ('+Math.round(((shot.angle%360)+360)%360)+'°)';
+    $('maskEd').classList.add('open');
+    this.setMode('in'); this.render();
+  },
+  close(save){
+    if(save&&this.idx>=0){
+      const shot=state.shots[this.idx];
+      shot.mask=this.mask;
+      const tc=document.createElement('canvas'); tc.width=tc.height=74;
+      const tx=tc.getContext('2d');
+      tx.drawImage(this.imgCan,0,0,74,74);
+      tx.fillStyle='rgba(111,199,230,.34)';
+      const sc=this.S/74;
+      for(let y=0;y<74;y++)for(let x=0;x<74;x++)
+        if(this.mask[((y*sc)|0)*this.S+((x*sc)|0)]) tx.fillRect(x,y,1,1);
+      shot.thumb=tc.toDataURL('image/jpeg',0.75);
+      state.needRebuild=true;
+      if(state.origGrid) $('rebuildPill').classList.add('show');
+      renderGallery(); toast('Mask updated — rebuild in Step 2');
+    }
+    $('maskEd').classList.remove('open');
+    this.idx=-1; this.ptrs.clear(); this.stroke=false; this.pinch=null;
+  },
+  setMode(m){ this.mode=m;
+    $('medIn').classList.toggle('on',m==='in');
+    $('medOut').classList.toggle('on',m==='out'); },
+  snapshot(){ this.undoStack.push(this.mask.slice()); if(this.undoStack.length>12) this.undoStack.shift(); },
+  undo(){ const pm=this.undoStack.pop(); if(pm){ this.mask=pm; this.dirtyTint=true; this.render(); } },
+  reset(){ const shot=state.shots[this.idx]; if(!shot) return;
+    this.snapshot(); this.mask=(shot.autoMask||shot.mask).slice(); this.dirtyTint=true; this.render(); },
+  paintDot(ix,iy){
+    const r=this.brush, S=this.S, v=this.mode==='in'?1:0, r2=r*r;
+    const x0=Math.max(0,Math.ceil(ix-r)), x1=Math.min(S-1,Math.floor(ix+r));
+    const y0=Math.max(0,Math.ceil(iy-r)), y1=Math.min(S-1,Math.floor(iy+r));
+    for(let y=y0;y<=y1;y++){ const dy=y-iy;
+      for(let x=x0;x<=x1;x++){ const dx=x-ix;
+        if(dx*dx+dy*dy<=r2) this.mask[y*S+x]=v; } }
+    this.dirtyTint=true;
+  },
+  paintLine(a,b){
+    const d=Math.hypot(b.x-a.x,b.y-a.y), steps=Math.max(1,Math.ceil(d/(Math.max(2,this.brush)*0.4)));
+    for(let i=0;i<=steps;i++) this.paintDot(a.x+(b.x-a.x)*i/steps, a.y+(b.y-a.y)*i/steps);
+  },
+  toImg(e){
+    const cv=$('medCanvas'), r=cv.getBoundingClientRect();
+    const px=(e.clientX-r.left)*(cv.width/r.width);
+    const py=(e.clientY-r.top)*(cv.height/r.height);
+    const sc=(cv.width/this.S)*this.view.s;
+    return {x:(px-this.view.tx)/sc, y:(py-this.view.ty)/sc};
+  },
+  clampView(){
+    const cv=$('medCanvas');
+    this.view.s=clamp(this.view.s,1,6);
+    const ext=this.S*(cv.width/this.S)*this.view.s;
+    this.view.tx=clamp(this.view.tx, cv.width-ext, 0);
+    this.view.ty=clamp(this.view.ty, cv.height-ext, 0);
+  },
+  render(){
+    const cv=$('medCanvas'); if(this.idx<0) return;
+    const dpr=window.devicePixelRatio||1;
+    const w=((cv.clientWidth||300)*dpr)|0;
+    if(cv.width!==w){ cv.width=w; cv.height=w; }
+    const ctx=cv.getContext('2d');
+    if(this.dirtyTint){
+      const od=this.tintCtx.createImageData(this.S,this.S);
+      for(let i=0,pp=0;i<this.mask.length;i++,pp+=4){
+        if(this.mask[i]){ od.data[pp]=111; od.data[pp+1]=199; od.data[pp+2]=230; od.data[pp+3]=110; }
+      }
+      this.tintCtx.putImageData(od,0,0);
+      this.dirtyTint=false;
+    }
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle='#05080d'; ctx.fillRect(0,0,cv.width,cv.height);
+    const sc=(cv.width/this.S)*this.view.s;
+    ctx.setTransform(sc,0,0,sc,this.view.tx,this.view.ty);
+    ctx.imageSmoothingEnabled=this.view.s<2;
+    ctx.drawImage(this.imgCan,0,0);
+    ctx.drawImage(this.tintCan,0,0);
+    ctx.setTransform(1,0,0,1,0,0);
+  }
+};
+window.MaskEd=MaskEd;
+(function(){
+  const cv=$('medCanvas');
+  cv.addEventListener('pointerdown',e=>{
+    if(MaskEd.idx<0) return;
+    cv.setPointerCapture(e.pointerId);
+    MaskEd.ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    if(MaskEd.ptrs.size===1){
+      MaskEd.snapshot(); MaskEd.stroke=true;
+      const pt=MaskEd.toImg(e); MaskEd.lastPt=pt; MaskEd.paintDot(pt.x,pt.y); MaskEd.render();
+    }else if(MaskEd.ptrs.size===2){
+      MaskEd.stroke=false;
+      const pts=[...MaskEd.ptrs.values()];
+      MaskEd.pinch={d:Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y),
+                    mx:(pts[0].x+pts[1].x)/2, my:(pts[0].y+pts[1].y)/2};
+    }
+  });
+  cv.addEventListener('pointermove',e=>{
+    const pt=MaskEd.ptrs.get(e.pointerId); if(!pt) return;
+    pt.x=e.clientX; pt.y=e.clientY;
+    if(MaskEd.ptrs.size===1&&MaskEd.stroke){
+      const p2=MaskEd.toImg(e); MaskEd.paintLine(MaskEd.lastPt,p2); MaskEd.lastPt=p2; MaskEd.render();
+    }else if(MaskEd.ptrs.size===2&&MaskEd.pinch){
+      const pts=[...MaskEd.ptrs.values()];
+      const d=Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y);
+      const mx=(pts[0].x+pts[1].x)/2, my=(pts[0].y+pts[1].y)/2;
+      const r=cv.getBoundingClientRect(), k=cv.width/r.width;
+      const f=(d||1)/(MaskEd.pinch.d||d||1);
+      const cxp=(MaskEd.pinch.mx-r.left)*k, cyp=(MaskEd.pinch.my-r.top)*k;
+      MaskEd.view.tx=cxp-(cxp-MaskEd.view.tx)*f+(mx-MaskEd.pinch.mx)*k;
+      MaskEd.view.ty=cyp-(cyp-MaskEd.view.ty)*f+(my-MaskEd.pinch.my)*k;
+      MaskEd.view.s*=f;
+      MaskEd.pinch={d,mx,my};
+      MaskEd.clampView(); MaskEd.render();
+    }
+  });
+  const up=e=>{ MaskEd.ptrs.delete(e.pointerId);
+    if(MaskEd.ptrs.size===0){ MaskEd.stroke=false; MaskEd.pinch=null; }
+    if(MaskEd.ptrs.size===1) MaskEd.pinch=null; };
+  cv.addEventListener('pointerup',up); cv.addEventListener('pointercancel',up);
+  $('medIn').addEventListener('click',()=>MaskEd.setMode('in'));
+  $('medOut').addEventListener('click',()=>MaskEd.setMode('out'));
+  $('medUndo').addEventListener('click',()=>MaskEd.undo());
+  $('medReset').addEventListener('click',()=>MaskEd.reset());
+  $('medCancel').addEventListener('click',()=>MaskEd.close(false));
+  $('medDone').addEventListener('click',()=>MaskEd.close(true));
+  $('medBrush').addEventListener('input',e=>{
+    MaskEd.brush=parseInt(e.target.value,10);
+    const dpx=Math.min(40,MaskEd.brush);
+    $('medBrushDot').style.width=dpx+'px'; $('medBrushDot').style.height=dpx+'px';
+  });
+})();
+
 /* ============================== live preview ============================== */
 const overlay=$('overlay'); const octx=overlay.getContext('2d');
 const prevCan=document.createElement('canvas'); prevCan.width=prevCan.height=PREVIEW_S;
@@ -582,8 +834,13 @@ let lastPrev=0, lastFill=0;
 function renderPreview(){
   if(!drawVideoSquare(prevCtx,PREVIEW_S)) return;
   const img=prevCtx.getImageData(0,0,PREVIEW_S,PREVIEW_S);
-  const bg=state.bgAuto?estimateBG(img.data,PREVIEW_S):state.bgColor;
-  const m=computeMask(img.data,PREVIEW_S,bg,state.threshold);
+  let m;
+  if(state.segMode==='bgdiff'&&state.bgRef){
+    m=diffMask(img.data,state.bgRef.prev,PREVIEW_S,state.threshold);
+  }else{
+    const bg=state.bgAuto?estimateBG(img.data,PREVIEW_S):state.bgColor;
+    m=computeMask(img.data,PREVIEW_S,bg,state.threshold);
+  }
   lastFill=maskFill(m);
   const od=maskCtx.createImageData(PREVIEW_S,PREVIEW_S);
   for(let i=0,p=0;i<m.length;i++,p+=4){
@@ -656,7 +913,11 @@ async function captureShot(){
     toast('Motion sensors enabled — capture again'); return;
   }
   let mask=null;
-  if(state.segMode==='ai'&&AI.status==='ready'){
+  if(state.segMode==='bgdiff'){
+    if(!state.bgRef){ toast('Capture the background first (empty scene, phone still)'); return; }
+    const img=capCtx.getImageData(0,0,CAPTURE_S,CAPTURE_S);
+    mask=diffMask(img.data,state.bgRef.cap,CAPTURE_S,state.threshold);
+  }else if(state.segMode==='ai'&&AI.status==='ready'){
     $('shotBtn').disabled=true;
     try{
       mask=await AI.maskFrom(c=>{ const vw=cam.videoWidth,vh=cam.videoHeight,mm=Math.min(vw,vh);
@@ -692,7 +953,8 @@ async function captureShot(){
   const sc=CAPTURE_S/74;
   for(let y=0;y<74;y++)for(let x=0;x<74;x++)
     if(mask[((y*sc)|0)*CAPTURE_S+((x*sc)|0)]) tctx.fillRect(x,y,1,1);
-  state.shots.push({mask,S:CAPTURE_S,angle,basis,thumb:th.toDataURL('image/jpeg',0.7)});
+  state.shots.push({mask,S:CAPTURE_S,angle,basis,thumb:th.toDataURL('image/jpeg',0.7),
+    photo:capCan.toDataURL('image/jpeg',0.85), autoMask:mask.slice()});
   state.needRebuild=true; $('rebuildPill').classList.toggle('show',!!state.origGrid);
   if(navigator.vibrate) navigator.vibrate(30);
   renderGallery();
@@ -704,6 +966,8 @@ function renderGallery(){
   state.shots.forEach((s,i)=>{
     const d=document.createElement('div'); d.className='thumb';
     const img=document.createElement('img'); img.src=s.thumb; d.appendChild(img);
+    img.addEventListener('click',()=>MaskEd.open(i));
+    const ed=document.createElement('span'); ed.className='edit'; ed.textContent='✎'; d.appendChild(ed);
     const a=document.createElement('span'); a.className='ang';
     a.textContent=Math.round(((s.angle%360)+360)%360)+'°'; d.appendChild(a);
     const del=document.createElement('button'); del.className='del'; del.textContent='✕';
@@ -1253,7 +1517,7 @@ async function genDemoShots(S,count,interactive){
     const sc=S/74;
     for(let yy=0;yy<74;yy++)for(let xx=0;xx<74;xx++)
       if(mask[((yy*sc)|0)*S+((xx*sc)|0)]) tx.fillRect(xx,yy,1,1);
-    state.shots.push({mask,S,angle:thDeg,basis,thumb:tc.toDataURL()});
+    state.shots.push({mask,S,angle:thDeg,basis,thumb:tc.toDataURL(),photo:null,autoMask:mask.slice()});
     if(interactive){ toast('Demo: rendering silhouettes '+(i+1)+'/'+count);
       await new Promise(res=>setTimeout(res,0)); }
   }
@@ -1336,6 +1600,18 @@ $('segSel').addEventListener('change',e=>{
   if(e.target.value==='ai'&&AI.status==='failed'){
     e.target.value='color'; toast('AI model unavailable on this device'); }
   state.segMode=e.target.value; syncSegUI();
+  if(state.segMode==='bgdiff'&&state.mode==='walk')
+    toast('Tip: Background photo works best in Rotate-object mode (phone stays still)');
+});
+$('bgRefBtn').addEventListener('click',()=>{
+  if(!state.camOn){ toast('Start the camera first'); return; }
+  if(!drawVideoSquare(capCtx,CAPTURE_S)){ toast('Camera not ready'); return; }
+  drawVideoSquare(prevCtx,PREVIEW_S);
+  state.bgRef={cap:capCtx.getImageData(0,0,CAPTURE_S,CAPTURE_S).data.slice(),
+               prev:prevCtx.getImageData(0,0,PREVIEW_S,PREVIEW_S).data.slice()};
+  $('bgRefStatus').textContent='Background captured ✓ — retake any time; keep the phone still.';
+  $('bgRefBtn').classList.add('on'); $('bgRefBtn').textContent='Retake background';
+  toast('Background captured — place the object and take your shots');
 });
 $('alignBtn').addEventListener('click',()=>{
   state.align=!state.align;
@@ -1383,7 +1659,7 @@ $('resetPostBtn').addEventListener('click',()=>resetPost(true));
   AI.init(); syncSegUI();
   renderGallery(); drawDial();
   requestAnimationFrame(tick);
-  $('verLine').textContent='v1.1 · visual-hull + U²-Net segmentation · '+
+  $('verLine').textContent='v1.3 · visual-hull · U²-Net · mask editor · background diff · '+
     (window.isSecureContext?'secure context':'non-secure context (camera disabled)');
 })();
 </script>
